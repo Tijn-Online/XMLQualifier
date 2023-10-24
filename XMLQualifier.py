@@ -1,8 +1,12 @@
+import logging
+import azure.functions as func
 import requests
 import datetime
 import zipfile
 import io
 import base64
+
+ 
 
 class EmailProcessor:
     def __init__(self, client_id, client_secret, tenant_id, email_address):
@@ -19,9 +23,13 @@ class EmailProcessor:
         self.tool_pickup_subfolder_name = "ToolPickup"
         self.manual_pickup_subfolder_name = "ManualPickup"
 
+ 
+
     def log(self, message):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp}] {message}")
+        logging.info(f"[{timestamp}] {message}")
+
+ 
 
     def get_access_token(self):
         token_url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/token"
@@ -32,8 +40,12 @@ class EmailProcessor:
             "resource": "https://graph.microsoft.com/",
         }
 
+ 
+
         self.log("Requesting access token...")
         self.log(token_url)
+
+ 
 
         try:
             token_response = requests.post(token_url, data=token_data)
@@ -47,6 +59,8 @@ class EmailProcessor:
         except KeyError as e:
             self.log(f"Error parsing token response: {e}")
             exit(1)
+
+ 
 
     def get_destination_folder_id(self, folder_name):
         folders_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/mailFolders"
@@ -62,6 +76,8 @@ class EmailProcessor:
             self.log(f"Error fetching mail folders: {e}")
             return None
 
+ 
+
     def message_exists(self, message_id):
         message_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/messages/{message_id}"
         try:
@@ -71,19 +87,27 @@ class EmailProcessor:
         except requests.exceptions.RequestException as e:
             return False  # Message does not exist
 
+ 
+
     def process_zip_attachments(self, attachments):
         xml_attachment_count = 0
         zip_attachments_count = 0
+
+ 
 
         for attachment in attachments:
             content_type = attachment.get("contentType", "")
             filename = attachment.get("name", "").lower()  # Get the filename in lowercase
             self.log(f"Analyzing an attachment with filetype: {content_type}")
 
+ 
+
             # Check if the file has a ".odf" or ".ODF" extension and skip it
             if filename.endswith((".ofd", ".OFD", ".xlsm", ".XLSM")):
                 self.log(f"Skipping a file on the ignore list: {filename}")
                 continue
+
+ 
 
             if content_type.startswith("application/zip") or content_type.startswith(
                     "application/x-zip-compressed") or content_type.startswith("application/octet-stream"):
@@ -92,14 +116,20 @@ class EmailProcessor:
                 if isinstance(zip_data, str):
                     zip_data = zip_data.encode("utf-8")
                 if zip_data:
-                    xml_attachment_count += self.process_nested_zips(io.BytesIO(base64.b64decode(zip_data)))
+                    xml_attachment_count += self.process_nested_zips(io.BytesIO(base64.b64decode(zip_data))))
+
+ 
 
             elif content_type.startswith("application/xml") or content_type.startswith("text/xml"):
                 xml_attachment_count += 1
                 self.log("Found XML attachment.")
 
+ 
+
         self.log(f"Total ZIP attachments: {zip_attachments_count}")
         self.log(f"Total XML attachments (including within ZIPs): {xml_attachment_count}")
+
+ 
 
         if xml_attachment_count == 1:
             self.log("Analysis Result: Moving to ToolPickup - Only 1 XML file found in the message")
@@ -107,6 +137,8 @@ class EmailProcessor:
         else:
             self.log("Analysis Result: Moving to ManualPickup")
             return self.manual_pickup_subfolder_name
+
+ 
 
     def process_nested_zips(self, zip_data):
         xml_count = 0
@@ -126,10 +158,16 @@ class EmailProcessor:
             self.log(f"Error extracting ZIP file: {e}")
         return xml_count
 
+ 
+
     def process_email_messages(self):
         folders_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/mailFolders/{self.inbox_folder_name}/childFolders"
 
+ 
+
         self.log(f"Fetching folders inside the '{self.inbox_folder_name}' folder...")
+
+ 
 
         try:
             response = requests.get(folders_url, headers=self.headers)
@@ -141,25 +179,39 @@ class EmailProcessor:
             self.log(f"Error fetching folders: {e}")
             exit(1)
 
+ 
+
         self.log("Subfolders within Inbox:")
+
+ 
 
         for folder in folders:
             self.log(f"- {folder['displayName']}")
+
+ 
 
         for folder in folders:
             if folder["displayName"] == self.ap_mailbox_subfolder_name:
                 ap_mailbox_subfolder_id = folder["id"]
                 inbox_messages_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/mailFolders/{ap_mailbox_subfolder_id}/messages?$expand=attachments"
 
+ 
+
                 self.log(f"Fetching email messages from the '{self.ap_mailbox_subfolder_name}' subfolder...")
+
+ 
 
                 # Initialize pagination parameters
                 page = 1
                 page_size = 1000  # Adjust this as needed
 
+ 
+
                 while True:
                     # Add pagination parameters to the URL
                     page_url = f"{inbox_messages_url}&$top={page_size}&$skip={(page - 1) * page_size}"
+
+ 
 
                     try:
                         response = requests.get(page_url, headers=self.headers)
@@ -167,15 +219,23 @@ class EmailProcessor:
                         inbox_messages = response.json().get("value", [])
                         self.log(f"Received {len(inbox_messages)} email messages from page {page}.")
 
+ 
+
                         if not inbox_messages:
                             break  # No more messages to process
+
+ 
 
                         for message in inbox_messages:
                             attachments = message.get("attachments", [])
                             move_folder = self.process_zip_attachments(attachments)
 
+ 
+
                             self.log(
                                 f"Analyzing message with subject: {message['subject']} from the '{self.ap_mailbox_subfolder_name}' subfolder...")
+
+ 
 
                             # Verify the message ID
                             message_id = message['id']
@@ -187,9 +247,13 @@ class EmailProcessor:
                             except requests.exceptions.RequestException as e:
                                 message_exists = False
 
+ 
+
                             if message_exists:
                                 self.log(f"Message with subject: {message['subject']} exists. Proceeding to move...")
                                 self.log(f"Message ID: {message_id}")
+
+ 
 
                                 # Verify the destination folder ID
                                 destination_folder_id = self.get_destination_folder_id(move_folder)
@@ -200,10 +264,14 @@ class EmailProcessor:
                             else:
                                 self.log(f"Message with subject: {message['subject']} no longer exists.")
 
+ 
+
                         page += 1  # Move to the next page
                     except requests.exceptions.RequestException as e:
                         self.log(f"Error fetching email messages: {e}")
                         break  # Stop pagination on error
+
+ 
 
     def move_email_message(self, message_id, destination_folder_id):
         move_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/messages/{message_id}/move"
@@ -211,7 +279,11 @@ class EmailProcessor:
             "destinationId": destination_folder_id,
         }
 
+ 
+
         self.log(f"Moving message with ID {message_id} to '{destination_folder_id}' folder...")
+
+ 
 
         try:
             move_response = requests.post(move_url, headers=self.headers, json=move_data)
@@ -222,11 +294,19 @@ class EmailProcessor:
             self.log(f"Move request failed with {move_response.status_code} status code.")
             self.log(f"Response content: {move_response.text}")
 
-if __name__ == "__main__":
+ 
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
     client_id = "ac6e12bf-fe16-4479-a941-a143e735cfcd"
     client_secret = "t5jsK-_sL-qQD1wcj7h5R~O3-o0Uxc_uWp"
     tenant_id = "a33c6ac4-a52e-45c5-af07-b972df9bd004"
     email_address = "iig.e-invoices@inter.ikea.com"
 
+ 
+
     processor = EmailProcessor(client_id, client_secret, tenant_id, email_address)
     processor.process_email_messages()
+
+ 
+
+    return func.HttpResponse("Email processing completed successfully.")
