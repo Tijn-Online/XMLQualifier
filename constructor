@@ -1,0 +1,397 @@
+import logging
+import azure.functions as func
+import requests
+import datetime
+import zipfile
+import io
+import base64
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+
+
+app = func.FunctionApp()
+
+@app.schedule(schedule="*/1 * * * *", arg_name="myTimer", run_on_startup=True, use_monitor=False)
+def timer_trigger01(myTimer: func.TimerRequest) -> None:
+    if myTimer.past_due:
+        logging.info('The timer is past due!')
+
+    main(myTimer)
+
+    logging.info('Python timer trigger function executed.')
+
+def main(mytimer: func.TimerRequest) -> None:
+    if mytimer.past_due:
+        logging.info('The timer is past due!')
+    client_id = "ac6e12bf-fe16-4479-a941-a143e735cfcd"
+    client_secret = "t5jsK-_sL-qQD1wcj7h5R~O3-o0Uxc_uWp"
+    tenant_id = "a33c6ac4-a52e-45c5-af07-b972df9bd004"
+    email_address = "test.Noreply.Einvoice@inter.ikea.com"
+
+    processor = EmailProcessor(client_id, client_secret, tenant_id, email_address)
+    processor.process_email_messages()
+
+
+class EmailProcessor:
+    def __init__(self, client_id, client_secret, tenant_id, email_address):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.tenant_id = tenant_id
+        self.email_address = email_address
+        self.access_token = self.get_access_token()
+        self.headers = {
+            "Authorization": f"Bearer {self.access_token}",
+        }
+        self.inbox_folder_name = "Inbox"
+        self.ap_mailbox_subfolder_name = "Inbox"
+        self.tool_pickup_subfolder_name = "Automatic processing"
+        self.manual_pickup_subfolder_name = "Manual processing"
+
+    def log(self, message):
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] {message}")
+
+    def get_access_token(self):
+        token_url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/token"
+        token_data = {
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "resource": "https://graph.microsoft.com/",
+        }
+
+        self.log("Requesting access token...")
+        self.log(token_url)
+
+        try:
+            token_response = requests.post(token_url, data=token_data)
+            token_response.raise_for_status()
+            access_token = token_response.json()["access_token"]
+            self.log("Access token obtained successfully.")
+            return access_token
+        except requests.exceptions.RequestException as e:
+            self.log(f"Error making token request: {e}")
+            exit(1)
+        except KeyError as e:
+            self.log(f"Error parsing token response: {e}")
+            exit(1)
+
+    def get_destination_folder_id(self, folder_name):
+        folders_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/mailFolders"
+        try:
+            response = requests.get(folders_url, headers=self.headers)
+            response.raise_for_status()
+            folders = response.json().get("value", [])
+            for folder in folders:
+                if folder["displayName"] == folder_name:
+                    return folder["id"]
+            return None  # Folder not found
+        except requests.exceptions.RequestException as e:
+            self.log(f"Error fetching mail folders: {e}")
+            if response.status_code == 404:
+                self.log(f"Response content: {response.text}")
+            return None
+
+    def message_exists(self, message_id):
+        message_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/messages/{message_id}"
+        try:
+            response = requests.get(message_url, headers=self.headers)
+            response.raise_for_status()
+            return True  # Message exists
+        except requests.exceptions.RequestException as e:
+            return False  # Message does not exist
+
+    def process_zip_attachments(self, attachments, xml_attachment_count):
+        xml_attachment_count = 0
+        zip_attachments_count = 0
+
+        for attachment in attachments:
+            content_type = attachment.get("contentType", "")
+            if content_type is None:
+                # Handle the case where content_type is not set
+                self.log("Warning: Attachment content type is not set.")
+                continue
+
+            filename = attachment.get("name", "").lower()  # Get the filename in lowercase
+            self.log(f"Analyzing an attachment with filetype: {content_type}")
+
+            # Check if the file has a ".odf" or ".ODF" extension and skip it
+            if filename.endswith((".ofd", ".OFD", ".xlsm", ".XLSM")):
+                self.log(f"Skipping a file on the ignore list: {filename}")
+                continue
+
+            if content_type.startswith("application/zip") or content_type.startswith(
+                    "application/x-zip-compressed") or content_type.startswith("application/octet-stream"):
+                zip_attachments_count += 1
+                zip_data = attachment.get("contentBytes", b"")
+                if isinstance(zip_data, str):
+                    zip_data = zip_data.encode("utf-8")
+                if zip_data:
+                    # Check the file extension
+                    if filename.endswith(".xml"):
+                        xml_attachment_count += 1
+                    else:
+                        # If the extension is not ".xml", check the content to determine if it's XML
+                        xml_attachment_count += self.check_xml_content(io.BytesIO(base64.b64decode(zip_data)))
+                    if not filename.endswith(".xml"):
+                        xml_attachment_count += self.process_nested_zips(io.BytesIO(base64.b64decode(zip_data)))
+
+            elif content_type.startswith("application/xml") or content_type.startswith("text/xml"):
+                xml_attachment_count += 1
+                self.log("Found XML attachment.")
+
+        self.log(f"Total ZIP attachments: {zip_attachments_count}")
+        self.log(f"Total XML attachments (including within ZIPs): {xml_attachment_count}")
+
+        if xml_attachment_count == 1:
+            self.log("Analysis Result: Moving to ToolPickup - Only 1 XML file found in the message")
+            return self.tool_pickup_subfolder_name
+        else:
+            self.log("Analysis Result: Moving to ManualPickup")
+            return self.manual_pickup_subfolder_name
+
+    def check_xml_content(self, file_data):
+        try:
+            # Read the first few bytes to determine if it's XML
+            file_header = file_data.read(50)
+            file_data.seek(0)  # Reset the file pointer to the beginning
+
+            if b"<?xml" in file_header:
+                self.log("Content check: Found XML content.")
+                return 1  # Indicates that it's an XML file
+            else:
+                self.log("Content check: Not XML content.")
+                return 0  # Indicates that it's not an XML file
+        except Exception as e:
+            self.log(f"Error checking XML content: {e}")
+            return 0  # Error occurred, assume it's not XML
+
+    def process_nested_zips(self, zip_data):
+        xml_count = 0
+        try:
+            with zipfile.ZipFile(zip_data, "r") as zip_file:
+                for zip_info in zip_file.infolist():
+                    if zip_info.filename.lower().endswith(".xml"):
+                        self.log(f"Found XML file '{zip_info.filename}' within the ZIP attachment.")
+                        xml_count += 1
+                    elif zip_info.filename.lower().endswith(".zip"):
+                        self.log(f"Found nested ZIP file '{zip_info.filename}' within the ZIP attachment.")
+                        nested_zip_data = zip_file.read(zip_info.filename)
+                        xml_count += self.process_nested_zips(io.BytesIO(nested_zip_data))
+        except zipfile.BadZipFile:
+            self.log("Error: Not a valid ZIP file. Skipping.")
+        except Exception as e:
+            self.log(f"Error extracting ZIP file: {e}")
+        return xml_count
+
+    def process_email_messages(self):
+        folder_id = self.get_destination_folder_id(self.ap_mailbox_subfolder_name)
+
+        if folder_id is None:
+            self.log(f"Folder '{self.ap_mailbox_subfolder_name}' not found.")
+            return
+
+        messages_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/mailFolders/{folder_id}/messages?$expand=attachments"
+
+        self.log(f"Fetching email messages from the '{self.ap_mailbox_subfolder_name}' folder...")
+
+        # Initialize pagination parameters
+        page = 1
+        page_size = 1000  # Adjust this as needed
+
+        while True:
+            # Add pagination parameters to the URL
+            page_url = f"{messages_url}&$top={page_size}&$skip={(page - 1) * page_size}"
+
+            try:
+                response = requests.get(page_url, headers=self.headers)
+                response.raise_for_status()
+                messages = response.json().get("value", [])
+                self.log(f"Received {len(messages)} email messages from page {page}.")
+
+                if not messages:
+                    break  # No more messages to process
+
+                for message in messages:
+                    attachments = message.get("attachments", [])
+                    xml_attachment_count = self.process_zip_attachments(attachments, 0)
+                    move_folder = self.process_zip_attachments(attachments, xml_attachment_count)
+
+                    self.log(
+                        f"Analyzing message with subject: {message['subject']} from the '{self.ap_mailbox_subfolder_name}' folder...")
+
+                    # Verify the message ID
+                    message_id = message['id']
+                    sender_email = message.get("from", {}).get("emailAddress", {}).get("address", "")
+                    message_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/messages/{message_id}"
+                    try:
+                        response = requests.get(message_url, headers=self.headers)
+                        response.raise_for_status()
+                        message_exists = True
+                    except requests.exceptions.RequestException as e:
+                        message_exists = False
+
+                    if message_exists:
+                        self.log(f"Message with subject: {message['subject']} exists. Proceeding to move...")
+                        self.log(f"Message ID: {message_id}")
+
+                        # Verify the destination folder ID
+                        destination_folder_id = self.get_destination_folder_id(move_folder)
+                        print(destination_folder_id)
+                        if destination_folder_id is not None:
+
+                            if xml_attachment_count in (1, 0):
+                                self.log("Analysis Result: Moving to ToolPickup - Only 1 XML file found in the message")
+                                # Extract the first (and only) XML attachment from the attachments list
+                                xml_attachment = next(
+                                    (a for a in attachments if a.get("name", "").endswith(".xml")),
+                                    None
+                                )
+
+                                if xml_attachment:
+                                    original_message = self.get_original_message(message_id)
+                                    modified_message = self.add_xml_as_eml_attachment(original_message, xml_attachment,
+                                                                                      sender_email)
+                                    if modified_message:
+                                        move_folder = self.tool_pickup_subfolder_name
+                                        print(destination_folder_id)
+                                        self.move_email_message(message_id, destination_folder_id, modified_message)
+                                    else:
+                                        self.log("Error: Failed to create modified message. Moving to ManualPickup.")
+                                        move_folder = self.manual_pickup_subfolder_name
+                                        self.move_email_message(message_id, destination_folder_id)
+                                else:
+                                    self.log("Error: No XML attachment found.")
+                            else:
+                                self.log("Analysis Result: Moving to ManualPickup")
+                                move_folder = self.manual_pickup_subfolder_name
+                                self.move_email_message(message_id, destination_folder_id)
+                        else:
+                            self.log(f"Destination folder '{move_folder}' not found.")
+                    else:
+                        self.log(f"Message with subject: {message['subject']} no longer exists.")
+
+                page += 1  # Move to the next page
+            except requests.exceptions.RequestException as e:
+                self.log(f"Error fetching email messages: {e}")
+                break  # Stop pagination on error
+
+    def get_original_message(self, message_id):
+        # Fetch the original message
+        original_message_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/messages/{message_id}/$value"
+        try:
+            response = requests.get(original_message_url, headers=self.headers)
+            response.raise_for_status()
+            return response.content
+        except requests.exceptions.RequestException as e:
+            self.log(f"Error fetching the original message: {e}")
+            return None
+
+    def add_xml_as_eml_attachment(self, original_message, xml_attachment, sender_email):
+        try:
+            if original_message:
+                self.log("Attempting to add an EML attachment with .msg file.")
+                # Create a MIMEMultipart message for the new email
+                msg = MIMEMultipart()
+
+                # Create a new email message for the XML attachment
+                xml_msg = MIMEMultipart()
+
+                # Attach the XML file
+                xml_attachment_data = xml_attachment.get("contentBytes", b"")
+                xml_attachment_mime = MIMEBase("application", "octet-stream")
+                xml_attachment_mime.set_payload(xml_attachment_data)
+                xml_attachment_mime.add_header("Content-Disposition", "attachment", filename="XML_Invoice.xml")
+                xml_msg.attach(xml_attachment_mime)
+
+                # Set the From header to match the original sender's email address
+                xml_msg["From"] = sender_email
+
+                # Attach the XML email as an attachment in the new email
+                xml_attachment_mime = MIMEBase("message", "rfc822")
+                xml_attachment_mime.set_payload(base64.b64encode(xml_msg.as_bytes()).decode('utf-8'))
+                xml_attachment_mime.add_header("Content-Disposition", "attachment", filename="Original_XML_Invoice.eml")
+                print("here")
+                encoders.encode_base64(xml_attachment_mime)  # Apply encoding to the payload, not the MIMEBase object
+                msg.attach(xml_attachment_mime)
+
+                # Create a new email attachment for the .msg file
+                msg_attachment_mime = MIMEBase("application", "octet-stream")
+                msg_attachment_mime.set_payload(original_message)
+                msg_attachment_mime.add_header("Content-Disposition", "attachment", filename="Original_XML_Invoice.msg")
+                msg.attach(msg_attachment_mime)
+
+                # Set the subject for the new email
+                msg["Subject"] = "Original XML invoice file"
+
+                # Set the sender for the new email
+                msg["From"] = sender_email
+
+                # Serialize the message to bytes
+                msg_bytes = msg.as_bytes()
+                self.log("XML attachment added as an EML attachment with .msg file.")
+                return msg_bytes
+        except Exception as e:
+            self.log(f"Error adding XML as EML attachment: {e}")
+            return None
+
+    def move_email_message(self, message_id, destination_folder_id, modified_message=None):
+        if destination_folder_id is None:
+            self.log(f"Destination folder ID is None. Skipping move for message ID {message_id}.")
+            return
+        destination_folder_id, destination_folder_name = self.get_destination_folder_details(destination_folder_id)
+        self.log(f"Destination Folder Name: {destination_folder_name}")
+        move_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/messages/{message_id}/move"
+        move_data = {
+            "destinationId": destination_folder_id,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",  # Include the Content-Type header
+        }
+
+        self.log(f"Moving message with ID {message_id} to '{destination_folder_id}' folder...")
+
+        try:
+            if modified_message:
+                # Convert modified_message to a base64-encoded string
+                modified_message_base64 = base64.b64encode(modified_message).decode('utf-8')
+                move_data["destinationId"] = destination_folder_id
+                move_data["message"] = {
+                    "subject": "Original XML invoice file",
+                    "body": {
+                        "content": "See attached XML invoice.",
+                        "contentType": "text"
+                    },
+                    "attachments": [
+                        {
+                            "@odata.type": "#microsoft.graph.fileAttachment",
+                            "name": "Original_XML_Invoice.eml",
+                            "contentBytes": modified_message_base64,
+                        }
+                    ]
+                }
+
+                move_response = requests.post(move_url, headers=headers, json=move_data)
+            else:
+                move_response = requests.post(move_url, headers=headers, json=move_data)
+            move_response.raise_for_status()
+            self.log(f"Message with ID {message_id} moved successfully to '{destination_folder_id}'.")
+        except requests.exceptions.RequestException as e:
+            self.log(f"Error moving message with ID {message_id}: {e}")
+            self.log(f"Move request failed with {move_response.status_code} status code.")
+            self.log(f"Response content: {move_response.text}")
+
+    def get_destination_folder_details(self, folder_id):
+        folder_url = f"https://graph.microsoft.com/v1.0/users/{self.email_address}/mailFolders/{folder_id}"
+        try:
+            response = requests.get(folder_url, headers=self.headers)
+            response.raise_for_status()
+            folder_details = response.json()
+            folder_name = folder_details.get("displayName", "")
+            return folder_id, folder_name
+        except requests.exceptions.RequestException as e:
+            self.log(f"Error fetching folder details: {e}")
+            return None, None
